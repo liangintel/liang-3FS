@@ -1,5 +1,6 @@
 mod aligned;
 mod bytes;
+pub mod dsa;
 mod result;
 mod shards_map;
 mod shards_set;

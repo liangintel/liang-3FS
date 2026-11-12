@@ -301,6 +301,7 @@ impl Engine {
         }
 
         // 1. prepare update info.
+        let mut pending_crc = None;
         let data = if req.length != 0 {
             // SAFETY: req.data pointer must be valid and remain live for the duration of this function.
             // The slice is consumed synchronously and immediately within safe_write/copy_on_write calls
@@ -308,14 +309,20 @@ impl Engine {
             // this would require refactoring to take ownership of the data (e.g., via Vec<u8>).
             let data =
                 unsafe { std::slice::from_raw_parts(req.data as *const _, req.length as usize) };
-            let checksum = crc32c::crc32c(data);
-            if req.without_checksum {
-                req.checksum = checksum;
-            } else if checksum != req.checksum {
-                return Err(Error::ChecksumMismatch(format!(
-                    "invalid checksum local {:08x} != remote {:08x}",
-                    checksum, req.checksum
-                )));
+            // With a client checksum the check can overlap the disk write (verified after step 4).
+            if !req.without_checksum {
+                pending_crc = crate::utils::dsa::Pending::submit(data);
+            }
+            if pending_crc.is_none() {
+                let checksum = crc32c::crc32c(data);
+                if req.without_checksum {
+                    req.checksum = checksum;
+                } else if checksum != req.checksum {
+                    return Err(Error::ChecksumMismatch(format!(
+                        "invalid checksum local {:08x} != remote {:08x}",
+                        checksum, req.checksum
+                    )));
+                }
             }
             data
         } else {
@@ -432,6 +439,16 @@ impl Engine {
                 new_chunk
             }
         };
+
+        if let Some(pending) = pending_crc {
+            let checksum = pending.wait().unwrap_or_else(|| crc32c::crc32c(data));
+            if checksum != req.checksum {
+                return Err(Error::ChecksumMismatch(format!(
+                    "invalid checksum local {:08x} != remote {:08x}",
+                    checksum, req.checksum
+                )));
+            }
+        }
 
         req.out_commit_ver = new_chunk_ver;
         req.out_chain_ver = req.chain_ver;
