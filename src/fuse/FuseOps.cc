@@ -29,6 +29,7 @@
 #include "common/monitor/Sample.h"
 #include "common/serde/Serde.h"
 #include "common/utils/Coroutine.h"
+#include "common/utils/DsaCrc.h"
 #include "common/utils/OptionalUtils.h"
 #include "common/utils/Path.h"
 #include "common/utils/RequestInfo.h"
@@ -61,6 +62,18 @@ void record(std::string_view op, uid_t uid) {
 FuseClients &getFuseClientsInstance() { return d; }
 
 namespace {
+// Copy a write payload into a registered buffer; with DSA the CRC comes for free and is left for the storage client.
+void copyWriteData(void *dst, const void *src, size_t len) {
+  if (dsa::enabled() && len >= dsa::minBytes()) {
+    if (auto crc = dsa::copyCrc32c(dst, src, len)) {
+      dsa::putHint(dst, len, *crc);
+      return;
+    }
+  }
+  dsa::dropHint(dst);
+  memcpy(dst, src, len);
+}
+
 class RequestInfo : public hf3fs::RequestInfo, folly::NonCopyableNonMovable {
  public:
   RequestInfo(fuse_req_t req)
@@ -1618,7 +1631,7 @@ void hf3fs_write(fuse_req_t req, fuse_ino_t fino, const char *buf, size_t size, 
     */
     auto memh = IOBuffer(folly::coro::blocking_wait(d.bufPool->allocate()));
 
-    memcpy((char *)memh.data(), buf, size);
+    copyWriteData((char *)memh.data(), buf, size);
     auto ret = flushBuf(req, pi, off, memh, size, false);
 
     writeLatency.addSample(SteadyClock::now() - start, monitor::TagSet{{"uid", uids}});
@@ -1663,7 +1676,7 @@ void hf3fs_write(fuse_req_t req, fuse_ino_t fino, const char *buf, size_t size, 
     size_t done = 0;
     do {
       auto cplen = std::min(size - done, wb->buf.size() - wb->len);
-      memcpy(wb->buf.data() + wb->len, buf + done, cplen);
+      copyWriteData(wb->buf.data() + wb->len, buf + done, cplen);
       wb->len += cplen;
       done += cplen;
       if (wb->len == wb->buf.size()) {

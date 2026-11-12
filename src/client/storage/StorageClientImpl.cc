@@ -12,6 +12,7 @@
 #include "common/logging/LogHelper.h"
 #include "common/monitor/Recorder.h"
 #include "common/monitor/ScopedMetricsWriter.h"
+#include "common/utils/DsaCrc.h"
 #include "common/utils/ExponentialBackoffRetry.h"
 #include "common/utils/RequestInfo.h"
 #include "common/utils/Result.h"
@@ -61,6 +62,16 @@ static monitor::CountRecorder num_completed_ops_per_user{"storage_client.num_com
 static monitor::CountRecorder num_failed_ops_per_user{"storage_client.num_failed_ops_per_user", true /*reset*/};
 static monitor::CountRecorder num_retried_ops_per_user{"storage_client.num_retried_ops_per_user", true /*reset*/};
 static monitor::CountRecorder data_payload_bytes_per_user{"storage_client.data_payload_bytes_per_user", true /*reset*/};
+
+// CRC32C of a write buffer: CRC left by a DSA copy+CRC, else DSA CRCGEN polled from the coroutine, else nullopt (CPU).
+static CoTask<std::optional<uint32_t>> dsaWriteChecksum(const uint8_t *data, size_t len) {
+  if (auto hint = dsa::takeHint(data, len)) co_return hint;
+  if (!dsa::enabled() || len < dsa::minBytes()) co_return std::nullopt;
+  auto job = std::make_unique<dsa::Job>();
+  if (!dsa::submit(*job, nullptr, data, len)) co_return std::nullopt;
+  while (!dsa::done(*job)) co_await folly::coro::co_reschedule_on_current_executor;
+  co_return dsa::result(*job);
+}
 
 /* Request context data */
 
@@ -1718,9 +1729,29 @@ CoTryTask<void> StorageClientImpl::batchReadWithoutRetry(ClientRequestContext &r
     }
 
     if (options.verifyChecksum()) {
-      for (auto readIO : batchIOs) {
+      // Submit the whole batch to DSA first so the CRCs run in parallel; the rest fall back to the CPU below.
+      std::vector<std::unique_ptr<dsa::Job>> jobs(batchIOs.size());
+      if (dsa::enabled()) {
+        for (size_t i = 0; i < batchIOs.size(); i++) {
+          auto readIO = batchIOs[i];
+          if (readIO->result.checksum.type != ChecksumType::CRC32C || !readIO->result.lengthInfo ||
+              *readIO->result.lengthInfo < dsa::minBytes())
+            continue;
+          jobs[i] = std::make_unique<dsa::Job>();
+          if (!dsa::submit(*jobs[i], nullptr, readIO->data, *readIO->result.lengthInfo)) jobs[i].reset();
+        }
+        for (auto &job : jobs) {
+          while (job && !dsa::done(*job)) co_await folly::coro::co_reschedule_on_current_executor;
+        }
+      }
+      for (size_t i = 0; i < batchIOs.size(); i++) {
+        auto readIO = batchIOs[i];
         if (readIO->result.lengthInfo && *readIO->result.lengthInfo > 0) {
-          auto checksum = ChecksumInfo::create(readIO->result.checksum.type, readIO->data, *readIO->result.lengthInfo);
+          std::optional<uint32_t> fast;
+          if (jobs[i]) fast = dsa::result(*jobs[i]);
+          auto checksum =
+              fast ? ChecksumInfo{readIO->result.checksum.type, *fast}
+                   : ChecksumInfo::create(readIO->result.checksum.type, readIO->data, *readIO->result.lengthInfo);
           if (FAULT_INJECTION_POINT(requestCtx.debugFlags.injectClientError(),
                                     true,
                                     checksum != readIO->result.checksum)) {
@@ -1876,10 +1907,14 @@ CoTryTask<void> StorageClientImpl::sendWriteRequest(ClientRequestContext &reques
   ops_per_request.addSample(1, requestCtx.requestTagSet);
 
   if (options.verifyChecksum()) {
-    writeIO->checksum = FAULT_INJECTION_POINT(
-        requestCtx.debugFlags.injectClientError(),
-        ChecksumInfo::create(config_.chunk_checksum_type(), writeIO->data, std::max(writeIO->length / 2, 1U)),
-        ChecksumInfo::create(config_.chunk_checksum_type(), writeIO->data, writeIO->length));
+    auto type = config_.chunk_checksum_type();
+    std::optional<uint32_t> fast;
+    if (type == ChecksumType::CRC32C) fast = co_await dsaWriteChecksum(writeIO->data, writeIO->length);
+    auto full = fast ? ChecksumInfo{type, *fast} : ChecksumInfo::create(type, writeIO->data, writeIO->length);
+    writeIO->checksum =
+        FAULT_INJECTION_POINT(requestCtx.debugFlags.injectClientError(),
+                              ChecksumInfo::create(type, writeIO->data, std::max(writeIO->length / 2, 1U)),
+                              full);
   }
 
   hf3fs::storage::RequestId requestId(writeIO->requestId);
